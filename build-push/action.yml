@@ -1,0 +1,57 @@
+name: build-push
+inputs:
+  aws-region:
+    required: false
+    default: eu-north-1
+  registry-type:
+    required: false
+    default: private
+  role-to-assume:
+    required: true
+  image:
+    required: true
+  tag:
+    required: true
+  containerfiles:
+    required: false
+    default: |
+      Containerfile
+runs:
+  using: composite
+  steps:
+    - uses: redhat-actions/buildah-build@v2.13
+      id: build
+      with:
+        containerfiles: ${{ inputs.containerfiles }}
+        image: ${{ inputs.image }}
+        tags: ${{ inputs.tag }}
+    - uses: aws-actions/configure-aws-credentials@v4.2.1
+      with:
+        aws-region: ${{ inputs.aws-region }}
+        role-to-assume: ${{ inputs.role-to-assume }}
+    - uses: aws-actions/amazon-ecr-login@v2.0.1
+      id: login
+      with:
+        registry-type: ${{ inputs.registry-type }}
+    - uses: redhat-actions/push-to-registry@v2.8
+      id: registry
+      with:
+        image: ${{ steps.build.outputs.image }}
+        tags: ${{ steps.build.outputs.tags }}
+        registry: ${{ steps.login.outputs.registry }}
+    - uses: cue-lang/setup-cue@v1.0.1
+      with:
+        version: v0.13.0
+    - uses: fluxcd/flux2/action@v2.5.1
+      with:
+        version: v2.4.0
+    - shell: bash
+      run: |
+        #!/usr/bin/env bash
+        cue export hack/kustomization.cue --out yaml --outfile config/kustomization.yaml \
+          --inject "name=${{ steps.login.outputs.registry }}/${{ steps.build.outputs.image}}" \
+          --inject "tag=${{ inputs.tag }}@${{ steps.registry.outputs.digest }}"
+        flux push artifact \
+          "oci://${{ steps.login.outputs.registry }}/${{ steps.build.outputs.image-with-tag }}-manifests" \
+          --path config --source "${{ github.repositoryUrl }}" \
+          --revision "${{ github.ref_name }}@sha1:${{ github.sha }}"
