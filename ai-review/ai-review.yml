@@ -1,0 +1,15 @@
+model: "gpt-4.1-mini"
+max_files: 80
+max_tokens_per_file: 2500
+inline_comments: true
+languages_hint:
+  - "go"
+  - "typescript"
+  - "python"
+  - "yaml"
+  - "cue"
+reject_large_binaries: true
+exclude_patterns:
+  - "**/*.png"
+  - "**/*.jpg"
+  - "**/*.pdf"
