@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,7 +88,7 @@ func run() error {
 		return err
 	}
 
-	files, err := collectFiles(repoRoot, cfg)
+	files, diffRange, err := collectFiles(repoRoot, cfg)
 	if err != nil {
 		return err
 	}
@@ -115,7 +117,14 @@ func run() error {
 	}
 
 	if cfg.inlineCommentsEnabled() {
-		if err := postInlineComments(result.Findings); err != nil {
+		var changedLines map[string]map[int]struct{}
+		if len(result.Findings) > 0 {
+			changedLines, err = getChangedLineNumbers(diffRange)
+			if err != nil {
+				return err
+			}
+		}
+		if err := postInlineComments(result.Findings, changedLines); err != nil {
 			return err
 		}
 	}
@@ -194,10 +203,10 @@ func loadSystemPrompt(path string) (string, error) {
 	return "You are a rigorous code reviewer.", nil
 }
 
-func collectFiles(repoRoot string, cfg config) ([]filePayload, error) {
-	paths, err := getChangedFiles()
+func collectFiles(repoRoot string, cfg config) ([]filePayload, string, error) {
+	paths, diffRange, err := getChangedFiles()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(paths) > cfg.MaxFiles {
 		paths = paths[:cfg.MaxFiles]
@@ -218,10 +227,27 @@ func collectFiles(repoRoot string, cfg config) ([]filePayload, error) {
 			Content:  content,
 		})
 	}
-	return collected, nil
+	return collected, diffRange, nil
 }
 
-func getChangedFiles() ([]string, error) {
+func getChangedFiles() ([]string, string, error) {
+	diffRange := determineDiffRange()
+	out, err := runCommand("git", "diff", "--name-only", diffRange)
+	if err != nil {
+		return nil, "", err
+	}
+	lines := strings.Split(out, "\n")
+	var files []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			files = append(files, line)
+		}
+	}
+	return files, diffRange, nil
+}
+
+func determineDiffRange() string {
 	baseRef := os.Getenv("GITHUB_BASE_REF")
 	diffRange := "HEAD~1...HEAD"
 
@@ -234,19 +260,7 @@ func getChangedFiles() ([]string, error) {
 		}
 	}
 
-	out, err := runCommand("git", "diff", "--name-only", diffRange)
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(out, "\n")
-	var files []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			files = append(files, line)
-		}
-	}
-	return files, nil
+	return diffRange
 }
 
 func runCommand(name string, args ...string) (string, error) {
@@ -541,8 +555,123 @@ func buildReviewBody(result reviewResult) string {
 	return b.String()
 }
 
-func postInlineComments(findings []finding) error {
-	if len(findings) == 0 {
+func getChangedLineNumbers(diffRange string) (map[string]map[int]struct{}, error) {
+	diff, err := runCommand("git", "diff", "--unified=0", diffRange)
+	if err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(strings.NewReader(diff))
+	changed := make(map[string]map[int]struct{})
+	var currentFile string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "+++ ") {
+			path := strings.TrimSpace(strings.TrimPrefix(line, "+++ "))
+			if path == "" || path == "/dev/null" {
+				currentFile = ""
+				continue
+			}
+			if strings.HasPrefix(path, "b/") {
+				path = strings.TrimPrefix(path, "b/")
+			}
+			currentFile = path
+			continue
+		}
+		if strings.HasPrefix(line, "@@ ") && currentFile != "" {
+			start, count, parseErr := parseNewHunkRange(line)
+			if parseErr != nil || count == 0 {
+				continue
+			}
+			fileLines, ok := changed[currentFile]
+			if !ok {
+				fileLines = make(map[int]struct{})
+				changed[currentFile] = fileLines
+			}
+			for i := start; i < start+count; i++ {
+				fileLines[i] = struct{}{}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return changed, nil
+}
+
+func parseNewHunkRange(header string) (int, int, error) {
+	parts := strings.Split(header, " ")
+	var newRange string
+	for _, part := range parts {
+		if strings.HasPrefix(part, "+") {
+			newRange = strings.TrimPrefix(part, "+")
+			break
+		}
+	}
+	if newRange == "" {
+		return 0, 0, errors.New("missing new range in hunk header")
+	}
+	nums := strings.Split(newRange, ",")
+	start, err := strconv.Atoi(nums[0])
+	if err != nil {
+		return 0, 0, err
+	}
+	count := 1
+	if len(nums) > 1 {
+		count, err = strconv.Atoi(nums[1])
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	return start, count, nil
+}
+
+func selectCommentLine(changedLines map[string]map[int]struct{}, f finding) int {
+	fileLines, ok := changedLines[f.File]
+	if !ok || len(fileLines) == 0 {
+		return 0
+	}
+	target := f.EndLine
+	if target == 0 {
+		target = f.StartLine
+	}
+	if target != 0 {
+		if _, ok := fileLines[target]; ok {
+			return target
+		}
+	}
+	start := f.StartLine
+	end := f.EndLine
+	if start == 0 && end == 0 {
+		for line := range fileLines {
+			return line
+		}
+		return 0
+	}
+	if start == 0 {
+		start = end
+	}
+	if end == 0 {
+		end = start
+	}
+	if start == 0 && end == 0 {
+		for line := range fileLines {
+			return line
+		}
+		return 0
+	}
+	if start > end {
+		start, end = end, start
+	}
+	for i := start; i <= end; i++ {
+		if _, ok := fileLines[i]; ok {
+			return i
+		}
+	}
+	return 0
+}
+
+func postInlineComments(findings []finding, changedLines map[string]map[int]struct{}) error {
+	if len(findings) == 0 || len(changedLines) == 0 {
 		return nil
 	}
 	token := os.Getenv("GITHUB_TOKEN")
@@ -593,7 +722,11 @@ func postInlineComments(findings []finding) error {
 
 	var comments []comment
 	for _, f := range findings {
-		if f.File == "" || f.StartLine == 0 || f.Details == "" {
+		if f.File == "" || f.Details == "" {
+			continue
+		}
+		line := selectCommentLine(changedLines, f)
+		if line == 0 {
 			continue
 		}
 		title := f.Title
@@ -604,15 +737,11 @@ func postInlineComments(findings []finding) error {
 		if f.SuggestedPatch != "" {
 			body += "```diff\n" + f.SuggestedPatch + "\n```"
 		}
-		line := f.EndLine
-		if line == 0 {
-			line = f.StartLine
-		}
 		comments = append(comments, comment{
 			Path:      f.File,
 			Body:      body,
 			Side:      "RIGHT",
-			StartLine: f.StartLine,
+			StartLine: line,
 			Line:      line,
 		})
 	}
