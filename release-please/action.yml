@@ -27,10 +27,21 @@ inputs:
     description: Path to release-please manifest file
     required: false
     default: .release-please-manifest.json
+outputs:
+  release_created:
+    description: True when a root release was created
+    value: ${{ steps.release.outputs.release_created }}
+  tag_name:
+    description: Created root release tag name
+    value: ${{ steps.release.outputs.tag_name }}
+  version:
+    description: Created root release version
+    value: ${{ steps.release.outputs.version }}
 runs:
   using: composite
   steps:
-    - uses: googleapis/release-please-action@v4
+    - id: release
+      uses: googleapis/release-please-action@v4
       with:
         command: ${{ inputs.command }}
         config-file: ${{ inputs.config-file }}
