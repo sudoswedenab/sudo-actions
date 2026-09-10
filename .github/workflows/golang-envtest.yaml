@@ -1,0 +1,39 @@
+name: golang-envtest
+on:
+  workflow_call:
+    inputs:
+      go-version-file:
+        type: string
+        required: false
+        default: go.mod
+      setup-envtest-version:
+        type: string
+        required: false
+        default: release-0.19
+      kubernetes-version:
+        type: string
+        required: false
+        default: 1.31.0
+      test-command:
+        type: string
+        required: false
+        default: go test ./... -v
+
+jobs:
+  envtest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-go@v5.5.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+      - name: Run envtest
+        shell: bash
+        run: |
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@${{ inputs.setup-envtest-version }}
+          source <(setup-envtest use --print env ${{ inputs.kubernetes-version }})
+          test -n "$KUBEBUILDER_ASSETS"
+          test -d "$KUBEBUILDER_ASSETS"
+          ${{ inputs.test-command }}
